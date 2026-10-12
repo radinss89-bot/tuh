@@ -47,7 +47,7 @@ WEBHOOK_SECRET = hashlib.sha256((TELEGRAM_TOKEN + "s").encode()).hexdigest()[:32
 
 ai = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com",
+base_url=os.getenv("AI_BASE_URL", "https://api.deepseek.com"),
     timeout=120,
     max_retries=2,
 )
