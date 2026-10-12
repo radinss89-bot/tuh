@@ -22,8 +22,8 @@ logging.basicConfig(
 log = logging.getLogger("bot")
 
 # ---------- Config (all from environment variables) ----------
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
+TELEGRAM_TOKEN = os.environ["8664423242:AAETohXA850ruJwqOWnZytP6zSTGck3YgPw"]
+DEEPSEEK_API_KEY = os.environ["sk-a67d2293e03d4ea3a453c40f8fcc9e5f"]
 CHAT_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 THINK_MODEL = os.getenv("DEEPSEEK_THINK_MODEL", "deepseek-reasoner")
 PORT = int(os.getenv("PORT", "10000"))
