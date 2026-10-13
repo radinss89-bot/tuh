@@ -60,7 +60,7 @@ ai = AsyncOpenAI(
 
 # ---------- In-memory state (resets on restart/sleep) ----------
 history = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
-think_mode = defaultdict(bool)
+think_mode = defaultdict(lambda: os.getenv("THINK_DEFAULT") == "1")
 locks = defaultdict(asyncio.Lock)
 hits = defaultdict(deque)
 
@@ -74,6 +74,11 @@ def rate_limited(uid: int) -> bool:
         return True
     q.append(now)
     return False
+
+
+def clean_answer(text: str) -> str:
+    """Remove the <think>...</think> reasoning block some models put in their reply."""
+    return re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.S).strip()
 
 
 def split_text(text: str, size: int = 4000):
@@ -130,8 +135,14 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     key = uid
 
     if msg.chat.type in ("group", "supergroup"):
-        # In groups, only answer messages that start with the trigger word "هوی"
-        if not re.match(r"^هوی(?!\w)", text):
+        # In groups, answer messages that start with "هوی" or that reply to the bot
+        replied = msg.reply_to_message
+        is_reply_to_bot = (
+            replied is not None
+            and replied.from_user is not None
+            and replied.from_user.id == ctx.bot.id
+        )
+        if not (is_reply_to_bot or re.match(r"^هوی(?!\w)", text)):
             return
         text = re.sub(r"^هوی[\s،,:!]*", "", text) or "سلام"
         text = f"{msg.from_user.first_name}: {text}"
@@ -156,7 +167,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 messages=[{"role": "system", "content": SYSTEM_PROMPT}, *hist],
                 max_tokens=4000 if use_think else 1500,
             )
-            answer = (resp.choices[0].message.content or "").strip() or "…"
+            answer = clean_answer(resp.choices[0].message.content or "") or "…"
             hist.append({"role": "assistant", "content": answer})
         except Exception:
             log.exception("DeepSeek request failed")
