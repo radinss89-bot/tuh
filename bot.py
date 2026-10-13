@@ -33,7 +33,7 @@ CHAT_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
 THINK_MODEL = os.getenv("DEEPSEEK_THINK_MODEL", "deepseek-reasoner")
 PORT = int(os.getenv("PORT", "10000"))
 BASE_URL = (os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
-HISTORY_LEN = int(os.getenv("HISTORY_LEN", "12"))  # messages kept per user
+HISTORY_LEN = int(os.getenv("HISTORY_LEN", "20"))  # messages kept per user
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "8"))  # requests per minute per user
 PING_INTERVAL = int(os.getenv("PING_INTERVAL", "600"))  # seconds; must be < 15 min
 ALLOWED_IDS = {
@@ -63,6 +63,76 @@ history = defaultdict(lambda: deque(maxlen=HISTORY_LEN))
 think_mode = defaultdict(lambda: os.getenv("THINK_DEFAULT") == "1")
 locks = defaultdict(asyncio.Lock)
 hits = defaultdict(deque)
+
+# ---------- Persistent memory (optional: set DATABASE_URL to a Postgres URL) ----------
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+KEEP_ROWS = 100  # messages stored per chat; only the last HISTORY_LEN are sent to the model
+pool = None  # asyncpg pool, created in post_init when DATABASE_URL is set
+
+
+async def init_db():
+    global pool
+    if not DATABASE_URL:
+        log.info("No DATABASE_URL: conversation memory is in RAM only (lost on restart).")
+        return
+    import asyncpg  # imported here so the bot still runs without the package
+
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
+    await pool.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cat_bot_history (
+            id BIGSERIAL PRIMARY KEY,
+            chat_key BIGINT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL
+        )
+        """
+    )
+    await pool.execute(
+        "CREATE INDEX IF NOT EXISTS cat_bot_history_key ON cat_bot_history (chat_key, id)"
+    )
+    log.info("Persistent memory enabled (Postgres).")
+
+
+async def get_history(key: int) -> list:
+    if pool is None:
+        return list(history[key])
+    rows = await pool.fetch(
+        "SELECT role, content FROM ("
+        "  SELECT id, role, content FROM cat_bot_history"
+        "  WHERE chat_key = $1 ORDER BY id DESC LIMIT $2"
+        ") t ORDER BY id",
+        key,
+        HISTORY_LEN,
+    )
+    return [{"role": r["role"], "content": r["content"]} for r in rows]
+
+
+async def add_messages(key: int, user_text: str, answer: str):
+    if pool is None:
+        history[key].append({"role": "user", "content": user_text})
+        history[key].append({"role": "assistant", "content": answer})
+        return
+    await pool.execute(
+        "INSERT INTO cat_bot_history (chat_key, role, content) "
+        "VALUES ($1, 'user', $2), ($1, 'assistant', $3)",
+        key,
+        user_text,
+        answer,
+    )
+    # Trim old rows so the free database doesn't fill up
+    await pool.execute(
+        "DELETE FROM cat_bot_history WHERE chat_key = $1 AND id NOT IN "
+        "(SELECT id FROM cat_bot_history WHERE chat_key = $1 ORDER BY id DESC LIMIT $2)",
+        key,
+        KEEP_ROWS,
+    )
+
+
+async def clear_history(key: int):
+    history[key].clear()
+    if pool is not None:
+        await pool.execute("DELETE FROM cat_bot_history WHERE chat_key = $1", key)
 
 
 def rate_limited(uid: int) -> bool:
@@ -116,7 +186,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     key = chat.id if chat.type in ("group", "supergroup") else update.effective_user.id
-    history[key].clear()
+    await clear_history(key)
     await update.message.reply_text("🧹 گفتگو از اول شروع شد.")
 
 
@@ -155,23 +225,28 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     async with locks[key]:
-        hist = history[key]
-        hist.append({"role": "user", "content": text})
         use_think = think_mode[uid]
 
         stop = asyncio.Event()
         typer = asyncio.create_task(keep_typing(msg.chat, stop))
         try:
+            hist = await get_history(key)
             resp = await ai.chat.completions.create(
                 model=THINK_MODEL if use_think else CHAT_MODEL,
-                messages=[{"role": "system", "content": SYSTEM_PROMPT}, *hist],
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    *hist,
+                    {"role": "user", "content": text},
+                ],
                 max_tokens=4000 if use_think else 1500,
             )
             answer = clean_answer(resp.choices[0].message.content or "") or "…"
-            hist.append({"role": "assistant", "content": answer})
+            try:
+                await add_messages(key, text, answer)
+            except Exception:
+                log.exception("Could not save history")
         except Exception:
             log.exception("DeepSeek request failed")
-            hist.pop()  # drop the unanswered user message
             answer = "⚠️ یه مشکلی پیش اومد، چند لحظه‌ی دیگه دوباره امتحان کن."
         finally:
             stop.set()
@@ -199,6 +274,12 @@ async def keep_alive():
 
 async def post_init(app: Application):
     app.bot_data["keep_alive"] = asyncio.create_task(keep_alive())
+    try:
+        await init_db()
+    except Exception:
+        global pool
+        pool = None
+        log.exception("Database init failed, falling back to RAM-only memory")
     await app.bot.set_my_commands(
         [
             BotCommand("start", "شروع"),
