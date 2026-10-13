@@ -2,9 +2,11 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 import time
 from collections import defaultdict, deque
 
+import httpx
 from openai import AsyncOpenAI
 from telegram import BotCommand, Update
 from telegram.constants import ChatAction
@@ -20,6 +22,9 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
 )
 log = logging.getLogger("bot")
+# Stop httpx from printing request URLs (they contain the bot token)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpx2").setLevel(logging.WARNING)
 
 # ---------- Config (all from environment variables) ----------
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
@@ -30,6 +35,7 @@ PORT = int(os.getenv("PORT", "10000"))
 BASE_URL = (os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL", "")).rstrip("/")
 HISTORY_LEN = int(os.getenv("HISTORY_LEN", "12"))  # messages kept per user
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "8"))  # requests per minute per user
+PING_INTERVAL = int(os.getenv("PING_INTERVAL", "600"))  # seconds; must be < 15 min
 ALLOWED_IDS = {
     int(x) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()
 }  # empty = everyone
@@ -47,7 +53,7 @@ WEBHOOK_SECRET = hashlib.sha256((TELEGRAM_TOKEN + "s").encode()).hexdigest()[:32
 
 ai = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
-base_url=os.getenv("AI_BASE_URL", "https://api.deepseek.com"),
+    base_url=os.getenv("AI_BASE_URL", "https://api.deepseek.com"),
     timeout=120,
     max_retries=2,
 )
@@ -103,7 +109,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def reset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    history[update.effective_user.id].clear()
+    chat = update.effective_chat
+    key = chat.id if chat.type in ("group", "supergroup") else update.effective_user.id
+    history[key].clear()
     await update.message.reply_text("🧹 گفتگو از اول شروع شد.")
 
 
@@ -118,6 +126,16 @@ async def think(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     uid = update.effective_user.id
+    text = msg.text
+    key = uid
+
+    if msg.chat.type in ("group", "supergroup"):
+        # In groups, only answer messages that start with the trigger word "هوی"
+        if not re.match(r"^هوی(?!\w)", text):
+            return
+        text = re.sub(r"^هوی[\s،,:!]*", "", text) or "سلام"
+        text = f"{msg.from_user.first_name}: {text}"
+        key = msg.chat.id  # one shared conversation per group
 
     if ALLOWED_IDS and uid not in ALLOWED_IDS:
         return
@@ -125,9 +143,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("⏳ خیلی سریع پیام می‌دی، چند ثانیه صبر کن.")
         return
 
-    async with locks[uid]:
-        hist = history[uid]
-        hist.append({"role": "user", "content": msg.text})
+    async with locks[key]:
+        hist = history[key]
+        hist.append({"role": "user", "content": text})
         use_think = think_mode[uid]
 
         stop = asyncio.Event()
@@ -156,7 +174,20 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
     log.error("Unhandled error", exc_info=ctx.error)
 
 
+async def keep_alive():
+    """Ping our own public URL so Render's free tier doesn't put the service to sleep."""
+    await asyncio.sleep(60)
+    async with httpx.AsyncClient(timeout=20) as client:
+        while True:
+            try:
+                await client.get(BASE_URL + "/")  # a 404 is fine, it still counts as traffic
+            except Exception as e:
+                log.warning("keep-alive ping failed: %s", e)
+            await asyncio.sleep(PING_INTERVAL)
+
+
 async def post_init(app: Application):
+    app.bot_data["keep_alive"] = asyncio.create_task(keep_alive())
     await app.bot.set_my_commands(
         [
             BotCommand("start", "شروع"),
